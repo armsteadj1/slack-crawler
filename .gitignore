@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/slack.db
+data/models/
+logs/
+.env
+*.log
+.env.bak
