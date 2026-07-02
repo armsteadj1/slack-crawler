@@ -1,8 +1,9 @@
 node_modules/
 dist/
-data/slack.db
-data/models/
+data/
 logs/
 .env
 *.log
 .env.bak
+slack-messages.db
+tmp-*

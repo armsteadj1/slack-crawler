@@ -5,6 +5,7 @@ export interface ConversationInfo {
   name: string;
   type: 'channel' | 'im' | 'mpim';
   is_private: boolean;
+  is_member?: boolean;
   member_count?: number;
 }
 
@@ -22,15 +23,42 @@ export function createClient(token: string): WebClient {
   return new WebClient(token);
 }
 
+function toConversationInfo(ch: any): ConversationInfo | null {
+  if (!ch?.id) return null;
+
+  let name: string;
+  let type: ConversationInfo['type'];
+
+  if (ch.is_im) {
+    name = `dm:${ch.user || ch.id}`;
+    type = 'im';
+  } else if (ch.is_mpim) {
+    name = ch.name || ch.purpose?.value || `group-dm:${ch.id}`;
+    type = 'mpim';
+  } else {
+    name = ch.name || ch.id;
+    type = 'channel';
+  }
+
+  return {
+    id: ch.id,
+    name,
+    type,
+    is_private: !!(ch.is_private || ch.is_im || ch.is_mpim),
+    is_member: ch.is_member,
+    member_count: ch.num_members,
+  };
+}
+
 /**
- * Get ALL conversations the user is a member of.
- * Uses users.conversations (NOT conversations.list).
+ * Get every conversation visible to the token:
+ * - users.conversations for membership-bound conversations, including DMs and private channels.
+ * - conversations.list for all public channels, including public channels the user is not in.
  *
- * conversations.list only returns open IMs and misses most DMs.
- * users.conversations returns everything: public/private channels, DMs, group DMs.
+ * conversations.list only returns open IMs and misses most DMs, so never use it as the only source.
  */
 export async function getAllConversations(client: WebClient): Promise<ConversationInfo[]> {
-  const conversations: ConversationInfo[] = [];
+  const conversations = new Map<string, ConversationInfo>();
   let cursor: string | undefined;
 
   do {
@@ -43,29 +71,8 @@ export async function getAllConversations(client: WebClient): Promise<Conversati
 
     if (resp.channels) {
       for (const ch of resp.channels as any[]) {
-        if (!ch.id) continue;
-
-        let name: string;
-        let type: ConversationInfo['type'];
-
-        if (ch.is_im) {
-          name = `dm:${ch.user || ch.id}`;
-          type = 'im';
-        } else if (ch.is_mpim) {
-          name = ch.name || ch.purpose?.value || `group-dm:${ch.id}`;
-          type = 'mpim';
-        } else {
-          name = ch.name || ch.id;
-          type = 'channel';
-        }
-
-        conversations.push({
-          id: ch.id,
-          name,
-          type,
-          is_private: !!(ch.is_private || ch.is_im || ch.is_mpim),
-          member_count: ch.num_members,
-        });
+        const convo = toConversationInfo(ch);
+        if (convo) conversations.set(convo.id, convo);
       }
     }
 
@@ -73,7 +80,27 @@ export async function getAllConversations(client: WebClient): Promise<Conversati
     if (cursor) await sleep(1100);
   } while (cursor);
 
-  return conversations;
+  cursor = undefined;
+  do {
+    const resp = await client.conversations.list({
+      types: 'public_channel',
+      limit: 200,
+      exclude_archived: false,
+      cursor,
+    });
+
+    if (resp.channels) {
+      for (const ch of resp.channels as any[]) {
+        const convo = toConversationInfo(ch);
+        if (convo) conversations.set(convo.id, convo);
+      }
+    }
+
+    cursor = resp.response_metadata?.next_cursor;
+    if (cursor) await sleep(1100);
+  } while (cursor);
+
+  return [...conversations.values()];
 }
 
 /**
@@ -152,23 +179,59 @@ export async function getThreadReplies(
   return messages;
 }
 
+let workspaceUserCache: Map<string, string> | null = null;
+
+async function getWorkspaceUserMap(client: WebClient): Promise<Map<string, string>> {
+  if (workspaceUserCache) return workspaceUserCache;
+
+  const map = new Map<string, string>();
+  let cursor: string | undefined;
+
+  do {
+    const resp = await client.users.list({ limit: 200, cursor });
+    for (const user of (resp.members || []) as any[]) {
+      if (!user?.id) continue;
+      map.set(user.id, user.real_name || user.profile?.real_name || user.name || user.id);
+    }
+
+    cursor = resp.response_metadata?.next_cursor;
+    if (cursor) await sleep(1100);
+  } while (cursor);
+
+  workspaceUserCache = map;
+  return map;
+}
+
 export async function getUsernames(
   client: WebClient,
   userIds: string[]
 ): Promise<Map<string, string>> {
   const map = new Map<string, string>();
   const unique = [...new Set(userIds)].filter(Boolean);
+  if (unique.length === 0) return map;
+
+  const workspaceUsers = await getWorkspaceUserMap(client);
+  const missing: string[] = [];
 
   for (const uid of unique) {
+    const name = workspaceUsers.get(uid);
+    if (name) map.set(uid, name);
+    else missing.push(uid);
+  }
+
+  for (const uid of missing) {
     try {
       const resp = await client.users.info({ user: uid });
       if (resp.user) {
-        map.set(uid, resp.user.real_name || resp.user.name || uid);
+        const name = resp.user.real_name || resp.user.profile?.real_name || resp.user.name || uid;
+        map.set(uid, name);
+        workspaceUsers.set(uid, name);
+      } else {
+        map.set(uid, uid);
       }
     } catch {
       map.set(uid, uid);
     }
-    await sleep(300);
   }
 
   return map;
